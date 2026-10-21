@@ -1,0 +1,4 @@
+napari[pyqt5]
+numpy
+tifffile
+superqt
