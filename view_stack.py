@@ -16,7 +16,7 @@ from pathlib import Path
 import napari
 import numpy as np
 import tifffile
-from qtpy.QtWidgets import QLabel, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 from superqt import QLabeledDoubleRangeSlider
 
 OBJ_MAG = 20.0
@@ -97,7 +97,7 @@ def build_box(z0: float, z1: float, Y: float, X: float):
 
 
 class ZRangeWidget(QWidget):
-    def __init__(self, viewer, image, box_layer, label_layer, nz, dz, Y, X):
+    def __init__(self, viewer, image, box_layer, label_layer, nz, dz, Y, X, show_numbers=True):
         super().__init__()
         self.viewer, self.image = viewer, image
         self.box_layer, self.label_layer = box_layer, label_layer
@@ -112,10 +112,21 @@ class ZRangeWidget(QWidget):
         self.slider.valueChanged.connect(self.update)
 
         self.info = QLabel()
+        self.numbers_cb = QCheckBox("Tick numbers")
+        self.numbers_cb.setChecked(show_numbers)
+        self.titles_cb = QCheckBox("Axis titles")
+        self.titles_cb.setChecked(show_numbers)
+        for cb in (self.numbers_cb, self.titles_cb):
+            cb.toggled.connect(lambda _: self.update(self.slider.value()))
+
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Z range (µm, from bottom plane)"))
         layout.addWidget(self.slider)
         layout.addWidget(self.info)
+        labels_row = QHBoxLayout()
+        labels_row.addWidget(self.numbers_cb)
+        labels_row.addWidget(self.titles_cb)
+        layout.addLayout(labels_row)
         layout.addStretch()
         self.update(self.slider.value())
 
@@ -132,6 +143,8 @@ class ZRangeWidget(QWidget):
         segs, pts, txt = build_box(k0 * self.dz, k1 * self.dz, self.Y, self.X)
         # Vectors layer data: (N, 2, 3) = [start, displacement]
         self.box_layer.data = np.stack([segs[:, 0], segs[:, 1] - segs[:, 0]], axis=1)
+        show_numbers, show_titles = self.numbers_cb.isChecked(), self.titles_cb.isChecked()
+        txt = [t if (show_titles if t.endswith("(µm)") else show_numbers) else "" for t in txt]
         self.label_layer.data = pts
         self.label_layer.text = {"string": txt, "color": BOX_COLOR, "size": 11, "anchor": "center"}
         self.info.setText(f"planes {k0}–{k1} of 0–{self.nz - 1}  ({(k1 - k0) * self.dz:g} µm)")
@@ -143,6 +156,7 @@ def main():
     ap.add_argument("--bin", type=int, default=2, help="XY binning for display (1 = full res, ~8 GB)")
     ap.add_argument("--z-scale", type=float, default=1.0,
                     help="multiply stage dz by this (e.g. refractive-index focal-shift correction)")
+    ap.add_argument("--no-labels", action="store_true", help="start with tick numbers and axis titles hidden")
     args = ap.parse_args()
 
     stack, dz = load_stack(args.dataset, args.bin)
@@ -166,7 +180,7 @@ def main():
         np.zeros((0, 3)), name="box labels", size=0, face_color="transparent",
         border_width=0, ndim=3,
     )
-    widget = ZRangeWidget(viewer, image, box, labels, nz, dz, Y, X)
+    widget = ZRangeWidget(viewer, image, box, labels, nz, dz, Y, X, show_numbers=not args.no_labels)
     viewer.window.add_dock_widget(widget, name="Z range", area="right")
     viewer.layers.selection.active = image
     viewer.scale_bar.visible = True
