@@ -1,5 +1,8 @@
 """View a Squid z-stack in napari with a white tick-marked bounding box and an adjustable z range.
 
+All channels in the acquisition are loaded as separate additive layers, colored with each
+channel's display_color from acquisition.yaml.
+
 Optics: Olympus 20x (designed for f=180 mm) used with a Nikon f=200 mm tube lens,
 so effective magnification = 20 * 200/180 = 22.22x -> 6.5 um / 22.22 = 0.2925 um/px.
 
@@ -16,6 +19,8 @@ from pathlib import Path
 import napari
 import numpy as np
 import tifffile
+import yaml
+from napari.utils import Colormap
 from qtpy.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 from superqt import QLabeledDoubleRangeSlider
 
@@ -26,15 +31,51 @@ SENSOR_PIXEL_UM = 6.5
 PIXEL_UM = SENSOR_PIXEL_UM / (OBJ_MAG * TUBE_F_MM / OBJ_DESIGN_TUBE_F_MM)
 
 BOX_COLOR = "white"
+FALLBACK_COLORS = ["#1FFF00", "#FF00FF", "#00FFFF", "#FFFF00", "#FF4040", "#4080FF"]
+
+# <region>_<fov>_<z>_<channel>.tiff, e.g. current_0_12_Fluorescence_488_nm_Ex.tiff
+FILE_RE = re.compile(r"^(?P<region>.+)_(?P<fov>\d+)_(?P<z>\d+)_(?P<channel>[A-Za-z].*)\.tiff?$")
 
 
-def load_stack(dataset: Path, binning: int) -> tuple[np.ndarray, float]:
+def channel_colors(dataset: Path) -> dict[str, str]:
+    """Map channel name (spaces -> underscores, as in filenames) to its display color."""
+    try:
+        cfg = yaml.safe_load((dataset / "acquisition.yaml").read_text())
+        return {c["name"].replace(" ", "_"): c["display_color"] for c in cfg.get("channels", [])}
+    except Exception:
+        return {}
+
+
+def short_name(channel: str) -> str:
+    m = re.search(r"(\d+)_?nm", channel)
+    return f"{m.group(1)} nm" if m else channel.replace("_", " ")
+
+
+def wavelength(channel: str) -> float:
+    m = re.search(r"(\d+)_?nm", channel)
+    return float(m.group(1)) if m else math.inf
+
+
+def load_channels(dataset: Path, binning: int) -> tuple[dict[str, np.ndarray], float]:
+    """Return ({channel: (z, y, x) stack}, dz_um) for the first region/FOV in the acquisition."""
     params = json.loads((dataset / "acquisition parameters.json").read_text())
     dz_um = float(params["dz(um)"])
-    files = sorted(
-        (dataset / "0").glob("current_0_*_*.tiff"),
-        key=lambda p: int(re.match(r"current_0_(\d+)_", p.name).group(1)),
-    )
+
+    entries = []
+    for path in (dataset / "0").glob("*.tif*"):
+        m = FILE_RE.match(path.name)
+        if m:
+            entries.append((m["region"], int(m["fov"]), int(m["z"]), m["channel"], path))
+    if not entries:
+        raise SystemExit(f"no <region>_<fov>_<z>_<channel>.tiff images found in {dataset / '0'}")
+    region, fov = min((r, f) for r, f, *_ in entries)
+    if len({(r, f) for r, f, *_ in entries}) > 1:
+        print(f"multiple regions/FOVs found; showing region '{region}' FOV {fov}")
+
+    by_channel: dict[str, list[tuple[int, Path]]] = {}
+    for r, f, z, ch, path in entries:
+        if (r, f) == (region, fov):
+            by_channel.setdefault(ch, []).append((z, path))
 
     def read(path):
         img = tifffile.imread(path)
@@ -43,9 +84,12 @@ def load_stack(dataset: Path, binning: int) -> tuple[np.ndarray, float]:
             img = img[:h, :w].reshape(h // binning, binning, w // binning, binning).mean(axis=(1, 3))
         return img.astype(np.uint16)
 
+    stacks = {}
     with ThreadPoolExecutor(max_workers=16) as pool:
-        planes = list(pool.map(read, files))
-    return np.stack(planes), dz_um
+        for ch in sorted(by_channel, key=wavelength):
+            files = [p for _, p in sorted(by_channel[ch])]
+            stacks[ch] = np.stack(list(pool.map(read, files)))
+    return stacks, dz_um
 
 
 def nice_step(extent: float, target_ticks: int = 5) -> float:
@@ -97,9 +141,9 @@ def build_box(z0: float, z1: float, Y: float, X: float):
 
 
 class ZRangeWidget(QWidget):
-    def __init__(self, viewer, image, box_layer, label_layer, nz, dz, Y, X, show_numbers=True):
+    def __init__(self, viewer, images, box_layer, label_layer, nz, dz, Y, X, show_numbers=True):
         super().__init__()
-        self.viewer, self.image = viewer, image
+        self.viewer, self.images = viewer, images
         self.box_layer, self.label_layer = box_layer, label_layer
         self.nz, self.dz, self.Y, self.X = nz, dz, Y, X
 
@@ -112,6 +156,7 @@ class ZRangeWidget(QWidget):
         self.slider.valueChanged.connect(self.update)
 
         self.info = QLabel()
+        self.info.setWordWrap(True)
         self.numbers_cb = QCheckBox("Tick numbers")
         self.numbers_cb.setChecked(show_numbers)
         self.titles_cb = QCheckBox("Axis titles")
@@ -136,10 +181,11 @@ class ZRangeWidget(QWidget):
         if k1 < k0:
             k0, k1 = k1, k0
         # Clipping plane positions are interpreted in world (um) coordinates here.
-        self.image.experimental_clipping_planes = [
-            {"position": ((k0 - 0.5) * self.dz, 0, 0), "normal": (1, 0, 0), "enabled": True},
-            {"position": ((k1 + 0.5) * self.dz, 0, 0), "normal": (-1, 0, 0), "enabled": True},
-        ]
+        for image in self.images:
+            image.experimental_clipping_planes = [
+                {"position": ((k0 - 0.5) * self.dz, 0, 0), "normal": (1, 0, 0), "enabled": True},
+                {"position": ((k1 + 0.5) * self.dz, 0, 0), "normal": (-1, 0, 0), "enabled": True},
+            ]
         segs, pts, txt = build_box(k0 * self.dz, k1 * self.dz, self.Y, self.X)
         # Vectors layer data: (N, 2, 3) = [start, displacement]
         self.box_layer.data = np.stack([segs[:, 0], segs[:, 1] - segs[:, 0]], axis=1)
@@ -153,25 +199,34 @@ class ZRangeWidget(QWidget):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dataset", type=Path)
-    ap.add_argument("--bin", type=int, default=2, help="XY binning for display (1 = full res, ~8 GB)")
+    ap.add_argument("--bin", type=int, default=2, help="XY binning for display (1 = full res, needs lots of GPU memory)")
     ap.add_argument("--z-scale", type=float, default=1.0,
                     help="multiply stage dz by this (e.g. refractive-index focal-shift correction)")
     ap.add_argument("--no-labels", action="store_true", help="start with tick numbers and axis titles hidden")
     args = ap.parse_args()
 
-    stack, dz = load_stack(args.dataset, args.bin)
+    stacks, dz = load_channels(args.dataset, args.bin)
     dz *= args.z_scale
     px = PIXEL_UM * args.bin
-    nz, ny, nx = stack.shape
+    nz, ny, nx = next(iter(stacks.values())).shape
     Y, X = ny * px, nx * px
-    print(f"stack {stack.shape}, pixel {px:.4f} um, dz {dz:g} um, extent z={(nz-1)*dz:g} y={Y:.1f} x={X:.1f} um")
+    print(f"channels {list(stacks)}, stack {(nz, ny, nx)}, pixel {px:.4f} um, dz {dz:g} um, "
+          f"extent z={(nz-1)*dz:g} y={Y:.1f} x={X:.1f} um")
 
-    lo, hi = np.percentile(stack[:: max(1, nz // 20), ::4, ::4], [0.5, 99.95])
+    colors = channel_colors(args.dataset)
     viewer = napari.Viewer(ndisplay=3, title=args.dataset.name)
-    image = viewer.add_image(
-        stack, name="488 nm", scale=(dz, px, px), colormap="green",
-        contrast_limits=(float(lo), float(hi)), rendering="mip", blending="additive",
-    )
+    images = []
+    for i, (ch, stack) in enumerate(stacks.items()):
+        if stack.shape != (nz, ny, nx):
+            print(f"skipping {ch}: shape {stack.shape} != {(nz, ny, nx)}")
+            continue
+        color = colors.get(ch, FALLBACK_COLORS[i % len(FALLBACK_COLORS)])
+        cmap = Colormap([[0, 0, 0, 1], color], name=f"{short_name(ch)} {color}")
+        lo, hi = np.percentile(stack[:: max(1, nz // 20), ::4, ::4], [0.5, 99.95])
+        images.append(viewer.add_image(
+            stack, name=short_name(ch), scale=(dz, px, px), colormap=cmap,
+            contrast_limits=(float(lo), float(hi)), rendering="mip", blending="additive",
+        ))
     box = viewer.add_vectors(
         np.zeros((0, 2, 3)), ndim=3, name="bounding box", edge_width=0.002 * max(Y, X, nz * dz),
         edge_color=BOX_COLOR, length=1, vector_style="line",
@@ -180,9 +235,9 @@ def main():
         np.zeros((0, 3)), name="box labels", size=0, face_color="transparent",
         border_width=0, ndim=3,
     )
-    widget = ZRangeWidget(viewer, image, box, labels, nz, dz, Y, X, show_numbers=not args.no_labels)
+    widget = ZRangeWidget(viewer, images, box, labels, nz, dz, Y, X, show_numbers=not args.no_labels)
     viewer.window.add_dock_widget(widget, name="Z range", area="right")
-    viewer.layers.selection.active = image
+    viewer.layers.selection.active = images[-1]
     viewer.scale_bar.visible = True
     viewer.scale_bar.unit = "um"
     viewer.reset_view()

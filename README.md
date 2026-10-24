@@ -2,6 +2,8 @@
 
 Open a Squid z-stack acquisition in napari as a 3D volume with:
 
+- every channel as its own layer, colored with the channel's `display_color` from `acquisition.yaml` (additive blending; toggle/adjust each in the layer list)
+
 - a white bounding box with tick marks and µm labels on x, y and z
 - a **Z range** dock widget (two-handle slider, µm from the bottom plane) that clips the rendered volume and redraws the box/ticks to match
 - checkboxes in the same widget to show/hide the tick numbers and axis titles
@@ -39,7 +41,7 @@ pip install -r requirements.txt
 python view_stack.py <dataset_dir> [--bin 2] [--z-scale 1.0] [--no-labels]
 ```
 
-- `dataset_dir` — Squid acquisition folder containing `acquisition parameters.json` and `0/current_0_<z>_*.tiff`
+- `dataset_dir` — Squid acquisition folder containing `acquisition parameters.json` and `0/<region>_<fov>_<z>_<channel>.tiff` (if there are several regions/FOVs, the first one is shown)
 - `--bin` — XY binning used for display (default 2; `1` = full resolution, needs a lot of GPU memory for large stacks)
 - `--z-scale` — multiply the stage z step, e.g. to correct for refractive-index focal shift
 - `--no-labels` — start with tick numbers and axis titles hidden (box and tick marks stay)
