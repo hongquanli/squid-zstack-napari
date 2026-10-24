@@ -7,6 +7,7 @@ Open a Squid z-stack acquisition in napari as a 3D volume with:
 - a white bounding box with tick marks and µm labels on x, y and z
 - a **Z range** dock widget (two-handle slider, µm from the bottom plane) that clips the rendered volume and redraws the box/ticks to match
 - checkboxes in the same widget to show/hide the tick numbers and axis titles
+- contrast set from the max projection (5th–99.5th percentile) so the MIP view opens unsaturated; **Auto contrast (this z range)** recomputes it for the selected slab
 
 ## Desktop launcher (drag and drop)
 

@@ -21,7 +21,7 @@ import numpy as np
 import tifffile
 import yaml
 from napari.utils import Colormap
-from qtpy.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 from superqt import QLabeledDoubleRangeSlider
 
 OBJ_MAG = 20.0
@@ -90,6 +90,14 @@ def load_channels(dataset: Path, binning: int) -> tuple[dict[str, np.ndarray], f
             files = [p for _, p in sorted(by_channel[ch])]
             stacks[ch] = np.stack(list(pool.map(read, files)))
     return stacks, dz_um
+
+
+def mip_contrast(stack: np.ndarray) -> tuple[float, float]:
+    """Contrast limits suited to MIP rendering: percentiles of the z max-projection, not of voxels."""
+    step = max(1, stack.shape[-1] // 800)
+    mip = stack[:, ::step, ::step].max(axis=0)
+    lo, hi = np.percentile(mip, [5, 99.5])
+    return float(lo), float(max(hi, lo + 1))
 
 
 def nice_step(extent: float, target_ticks: int = 5) -> float:
@@ -163,6 +171,8 @@ class ZRangeWidget(QWidget):
         self.titles_cb.setChecked(show_numbers)
         for cb in (self.numbers_cb, self.titles_cb):
             cb.toggled.connect(lambda _: self.update(self.slider.value()))
+        auto_btn = QPushButton("Auto contrast (this z range)")
+        auto_btn.clicked.connect(self.auto_contrast)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Z range (µm, from bottom plane)"))
@@ -172,14 +182,21 @@ class ZRangeWidget(QWidget):
         labels_row.addWidget(self.numbers_cb)
         labels_row.addWidget(self.titles_cb)
         layout.addLayout(labels_row)
+        layout.addWidget(auto_btn)
         layout.addStretch()
         self.update(self.slider.value())
 
-    def update(self, value):
-        k0 = int(round(value[0] / self.dz))
-        k1 = int(round(value[1] / self.dz))
-        if k1 < k0:
-            k0, k1 = k1, k0
+    def z_indices(self) -> tuple[int, int]:
+        k0, k1 = (int(round(v / self.dz)) for v in self.slider.value())
+        return min(k0, k1), max(k0, k1)
+
+    def auto_contrast(self):
+        k0, k1 = self.z_indices()
+        for image in self.images:
+            image.contrast_limits = mip_contrast(image.data[k0 : k1 + 1])
+
+    def update(self, value=None):
+        k0, k1 = self.z_indices()
         # Clipping plane positions are interpreted in world (um) coordinates here.
         for image in self.images:
             image.experimental_clipping_planes = [
@@ -222,10 +239,9 @@ def main():
             continue
         color = colors.get(ch, FALLBACK_COLORS[i % len(FALLBACK_COLORS)])
         cmap = Colormap([[0, 0, 0, 1], color], name=f"{short_name(ch)} {color}")
-        lo, hi = np.percentile(stack[:: max(1, nz // 20), ::4, ::4], [0.5, 99.95])
         images.append(viewer.add_image(
             stack, name=short_name(ch), scale=(dz, px, px), colormap=cmap,
-            contrast_limits=(float(lo), float(hi)), rendering="mip", blending="additive",
+            contrast_limits=mip_contrast(stack), rendering="mip", blending="additive",
         ))
     box = viewer.add_vectors(
         np.zeros((0, 2, 3)), ndim=3, name="bounding box", edge_width=0.002 * max(Y, X, nz * dz),
